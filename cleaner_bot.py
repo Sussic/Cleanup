@@ -6,7 +6,7 @@ import discord
 from discord.ext import commands, tasks
 
 # === CONFIG ===
-TOKEN = os.getenv("DISCORD_TOKEN")          # <- paste your bot token here
+TOKEN = os.getenv("BOT_TOKEN")          # <- paste your bot token here
 CHANNEL_ID = 1439052099794108470        # <- channel ID to clean (int)
 CLEAN_OLDER_THAN_DAYS = 0              # delete messages older than this
 CHECK_EVERY_MINUTES = 60               # how often to run the cleanup
