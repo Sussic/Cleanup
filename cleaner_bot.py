@@ -6,14 +6,16 @@ import discord
 from discord.ext import commands, tasks
 
 # === CONFIG ===
-TOKEN = os.getenv("BOT_TOKEN")          # <- paste your bot token here
-CHANNEL_ID = 1439052099794108470        # <- channel ID to clean (int)
-CLEAN_OLDER_THAN_DAYS = 0              # delete messages older than this
+TOKEN = os.getenv("BOT_TOKEN")          # read from env (do NOT paste the token here)
+CHANNEL_ID = 1439052099794108470
+CLEAN_OLDER_THAN_DAYS = 7              # delete messages older than 7 days
 CHECK_EVERY_MINUTES = 60               # how often to run the cleanup
 
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is not set")
 
 intents = discord.Intents.default()
-intents.message_content = True  # may be required for some bots to read messages
+intents.message_content = True
 intents.messages = True
 intents.guilds = True
 
@@ -39,69 +41,64 @@ async def cleanup_old_messages():
 
     now = datetime.now(timezone.utc)
     cutoff_older_than = now - timedelta(days=CLEAN_OLDER_THAN_DAYS)
-    cutoff_discord_limit = now - timedelta(days=14)  # can't bulk delete older than this
+    bulk_limit_age = timedelta(days=14)  # Discord bulk delete limit
 
     print(f"[{datetime.now()}] Cleaning channel {channel.id}...")
 
-    # We only want messages:
-    #   created_at < cutoff_older_than (older than X days)
-    #   and created_at > cutoff_discord_limit (younger than 14 days)
-    to_delete_batch = []
+    to_bulk_delete = []
     deleted_count = 0
 
     async for message in channel.history(limit=None, before=cutoff_older_than, oldest_first=False):
-        # stop if we hit messages older than 14 days (Discord bulk delete limit)
-        if message.created_at < cutoff_discord_limit:
-            break
+        age = now - message.created_at
 
-        to_delete_batch.append(message)
+        # Only touch messages older than CLEAN_OLDER_THAN_DAYS
+        if age < timedelta(days=CLEAN_OLDER_THAN_DAYS):
+            continue
 
-        # Discord bulk delete max is 100 messages
-        if len(to_delete_batch) == 100:
-            await channel.delete_messages(to_delete_batch)
-            deleted_count += len(to_delete_batch)
-            to_delete_batch.clear()
-            await asyncio.sleep(1)  # small delay to avoid rate limits
+        # If newer than 14 days -> we can bulk delete
+        if age <= bulk_limit_age:
+            to_bulk_delete.append(message)
+            if len(to_bulk_delete) == 100:
+                await channel.delete_messages(to_bulk_delete)
+                deleted_count += len(to_bulk_delete)
+                to_bulk_delete.clear()
+                await asyncio.sleep(1)  # avoid rate limits
+        else:
+            # Older than 14 days -> delete individually
+            try:
+                await message.delete()
+                deleted_count += 1
+                await asyncio.sleep(1)  # be gentle with rate limits
+            except discord.HTTPException:
+                pass
 
-    # Delete any remaining messages not yet deleted
-    if to_delete_batch:
-        await channel.delete_messages(to_delete_batch)
-        deleted_count += len(to_delete_batch)
+    # Delete any remaining bulk-able messages
+    if to_bulk_delete:
+        await channel.delete_messages(to_bulk_delete)
+        deleted_count += len(to_bulk_delete)
 
     print(f"Cleanup complete. Deleted {deleted_count} messages.")
 
 
-# Optional: command to trigger manual cleanup
 @bot.command(name="clean")
 @commands.has_permissions(manage_messages=True)
 async def cleanweek(ctx):
-    # Try to delete the user's command message
     try:
         await ctx.message.delete()
-    except discord.Forbidden:
-        pass  # bot doesn't have permission
-    except discord.HTTPException:
-        pass  # some other deletion error, ignore
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
-    # Send a status message
     status_msg = await ctx.send("Starting manual cleanup of messages older than 7 days...")
-
-    # Run the cleanup once
     await cleanup_old_messages()
-
-    # Edit the status so you see it's done (optional)
     try:
         await status_msg.edit(content="Manual cleanup finished.")
     except discord.HTTPException:
         pass
-
-    # Wait a few seconds, then delete the status message too
     await asyncio.sleep(5)
     try:
         await status_msg.delete()
     except discord.HTTPException:
         pass
-
 
 
 bot.run(TOKEN)
