@@ -3,7 +3,6 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 import discord
-from discord.ext import commands, tasks
 
 # === CONFIG ===
 TOKEN = os.getenv("BOT_TOKEN")          # read from env (do NOT paste the token here)
@@ -16,25 +15,17 @@ CHANNEL_IDS = [
 ]
 
 CLEAN_OLDER_THAN_DAYS = 7              # delete messages older than 7 days
-CHECK_EVERY_MINUTES = 60               # how often to run the cleanup
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is not set")
 
 intents = discord.Intents.default()
-intents.message_content = True
 intents.messages = True
 intents.guilds = True
+# message_content is not required for deletion, only for reading content
 
-bot = commands.Bot(command_prefix="!", intents=intents)
 
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    if not cleanup_old_messages.is_running():
-        cleanup_old_messages.start()
-    print("Cleanup loop started.")
+client = discord.Client(intents=intents)
 
 
 async def _cleanup_single_channel(channel: discord.TextChannel, now: datetime) -> int:
@@ -49,6 +40,7 @@ async def _cleanup_single_channel(channel: discord.TextChannel, now: datetime) -
     to_bulk_delete = []
     deleted_count = 0
 
+    # Only look at messages older than the cutoff
     async for message in channel.history(limit=None, before=cutoff_older_than, oldest_first=False):
         age = now - message.created_at
 
@@ -82,17 +74,16 @@ async def _cleanup_single_channel(channel: discord.TextChannel, now: datetime) -
     return deleted_count
 
 
-@tasks.loop(minutes=CHECK_EVERY_MINUTES)
-async def cleanup_old_messages():
-    await bot.wait_until_ready()
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user} (ID: {client.user.id})")
+    print(f"Starting one-shot cleanup for {len(CHANNEL_IDS)} channels...")
 
     now = datetime.now(timezone.utc)
     total_deleted = 0
 
-    print(f"[{datetime.now()}] Starting scheduled cleanup over {len(CHANNEL_IDS)} channels...")
-
     for channel_id in CHANNEL_IDS:
-        channel = bot.get_channel(channel_id)
+        channel = client.get_channel(channel_id)
         if channel is None:
             print(f"Could not find channel with ID {channel_id}")
             continue
@@ -100,41 +91,14 @@ async def cleanup_old_messages():
         deleted = await _cleanup_single_channel(channel, now)
         total_deleted += deleted
 
-    print(f"Scheduled cleanup complete. Deleted {total_deleted} messages in total.")
+    print(f"Cleanup complete. Deleted {total_deleted} messages in total.")
+    # Disconnect the client so the process exits
+    await client.close()
 
 
-@bot.command(name="clean")
-@commands.has_permissions(manage_messages=True)
-async def cleanweek(ctx: commands.Context):
-    try:
-        await ctx.message.delete()
-    except (discord.Forbidden, discord.HTTPException):
-        pass
-
-    status_msg = await ctx.send(
-        f"Starting manual cleanup of messages older than {CLEAN_OLDER_THAN_DAYS} days..."
-    )
-
-    now = datetime.now(timezone.utc)
-    total_deleted = 0
-
-    for channel_id in CHANNEL_IDS:
-        channel = bot.get_channel(channel_id)
-        if channel is None:
-            continue
-        deleted = await _cleanup_single_channel(channel, now)
-        total_deleted += deleted
-
-    try:
-        await status_msg.edit(content=f"Manual cleanup finished. Deleted {total_deleted} messages.")
-    except discord.HTTPException:
-        pass
-
-    await asyncio.sleep(5)
-    try:
-        await status_msg.delete()
-    except discord.HTTPException:
-        pass
+def main():
+    client.run(TOKEN)
 
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+    main()
