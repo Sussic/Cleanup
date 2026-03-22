@@ -2,12 +2,17 @@ name: Daily Cleanup Bot
 
 on:
   schedule:
-    - cron: "0 3 * * *"   # Runs every day at 03:00 UTC
-  workflow_dispatch:       # Allows you to run it manually
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: cleanup-bot
+  cancel-in-progress: true
 
 jobs:
   run-cleaner:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repo
