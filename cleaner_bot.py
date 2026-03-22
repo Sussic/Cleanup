@@ -4,95 +4,154 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 
-# === CONFIG ===
-TOKEN = os.getenv("BOT_TOKEN")          # read from env (do NOT paste the token here)
+TOKEN = os.getenv("BOT_TOKEN")
 
-# List of channels to clean
 CHANNEL_IDS = [
     1439052099794108470,
     1447026793386082527,
-    1447025718725967882
+    1447025718725967882,
 ]
 
-CLEAN_OLDER_THAN_DAYS = 7              # delete messages older than 7 days
+DELETE_AFTER_DAYS = 30
+RETENTION_WINDOW_DAYS = 1
+
+MAX_RETENTION_DELETES_PER_CHANNEL = 500
+MAX_BACKLOG_DELETES_PER_CHANNEL = 200
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is not set")
 
 intents = discord.Intents.default()
-intents.messages = True
 intents.guilds = True
-# message_content is not required for deletion, only for reading content
-
+intents.messages = True
 
 client = discord.Client(intents=intents)
 
 
-async def _cleanup_single_channel(channel: discord.TextChannel, now: datetime) -> int:
+async def delete_messages_in_window(
+    channel: discord.TextChannel,
+    now: datetime,
+    older_than_days: int,
+    newer_than_days: int,
+    max_deletes: int,
+) -> int:
     """
-    Cleans a single channel and returns the number of deleted messages.
+    Delete messages where:
+      newer_than_days < age <= older_than_days
+    Example:
+      older_than_days=31, newer_than_days=30
+      => delete messages 30-31 days old
     """
-    cutoff_older_than = now - timedelta(days=CLEAN_OLDER_THAN_DAYS)
-    bulk_limit_age = timedelta(days=14)  # Discord bulk delete limit
+    before_dt = now - timedelta(days=newer_than_days)
+    after_dt = now - timedelta(days=older_than_days)
 
-    print(f"[{datetime.now()}] Cleaning channel {channel.id}...")
+    deleted = 0
 
-    to_bulk_delete = []
-    deleted_count = 0
+    async for message in channel.history(
+        limit=None,
+        before=before_dt,
+        after=after_dt,
+        oldest_first=False,
+    ):
+        try:
+            await message.delete()
+            deleted += 1
 
-    # Only look at messages older than the cutoff
-    async for message in channel.history(limit=None, before=cutoff_older_than, oldest_first=False):
-        age = now - message.created_at
+            if deleted % 10 == 0:
+                await asyncio.sleep(1)
 
-        # Only touch messages older than CLEAN_OLDER_THAN_DAYS
-        if age < timedelta(days=CLEAN_OLDER_THAN_DAYS):
-            continue
+            if deleted >= max_deletes:
+                break
 
-        # If newer than 14 days -> we can bulk delete
-        if age <= bulk_limit_age:
-            to_bulk_delete.append(message)
-            if len(to_bulk_delete) == 100:
-                await channel.delete_messages(to_bulk_delete)
-                deleted_count += len(to_bulk_delete)
-                to_bulk_delete.clear()
-                await asyncio.sleep(1)  # avoid rate limits
-        else:
-            # Older than 14 days -> delete individually
-            try:
-                await message.delete()
-                deleted_count += 1
-                await asyncio.sleep(1)  # be gentle with rate limits
-            except discord.HTTPException:
-                pass
+        except discord.HTTPException as e:
+            print(f"Failed to delete message {message.id} in {channel.id}: {e}")
 
-    # Delete any remaining bulk-able messages
-    if to_bulk_delete:
-        await channel.delete_messages(to_bulk_delete)
-        deleted_count += len(to_bulk_delete)
+    return deleted
 
-    print(f"Channel {channel.id}: deleted {deleted_count} messages.")
-    return deleted_count
+
+async def delete_backlog(
+    channel: discord.TextChannel,
+    now: datetime,
+    older_than_days: int,
+    max_deletes: int,
+) -> int:
+    """
+    Delete messages older than older_than_days, capped per run.
+    """
+    before_dt = now - timedelta(days=older_than_days)
+    deleted = 0
+
+    async for message in channel.history(
+        limit=None,
+        before=before_dt,
+        oldest_first=False,
+    ):
+        try:
+            await message.delete()
+            deleted += 1
+
+            if deleted % 10 == 0:
+                await asyncio.sleep(1)
+
+            if deleted >= max_deletes:
+                break
+
+        except discord.HTTPException as e:
+            print(f"Failed to delete backlog message {message.id} in {channel.id}: {e}")
+
+    return deleted
+
+
+async def cleanup_channel(channel: discord.TextChannel, now: datetime) -> int:
+    total_deleted = 0
+
+    print(f"Channel {channel.id}: retention cleanup start")
+    retention_deleted = await delete_messages_in_window(
+        channel=channel,
+        now=now,
+        older_than_days=DELETE_AFTER_DAYS + RETENTION_WINDOW_DAYS,  # 31
+        newer_than_days=DELETE_AFTER_DAYS,                          # 30
+        max_deletes=MAX_RETENTION_DELETES_PER_CHANNEL,
+    )
+    total_deleted += retention_deleted
+    print(f"Channel {channel.id}: retention deleted {retention_deleted}")
+
+    print(f"Channel {channel.id}: backlog cleanup start")
+    backlog_deleted = await delete_backlog(
+        channel=channel,
+        now=now,
+        older_than_days=DELETE_AFTER_DAYS + RETENTION_WINDOW_DAYS,  # >31 days
+        max_deletes=MAX_BACKLOG_DELETES_PER_CHANNEL,
+    )
+    total_deleted += backlog_deleted
+    print(f"Channel {channel.id}: backlog deleted {backlog_deleted}")
+
+    return total_deleted
 
 
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
-    print(f"Starting one-shot cleanup for {len(CHANNEL_IDS)} channels...")
-
     now = datetime.now(timezone.utc)
     total_deleted = 0
 
     for channel_id in CHANNEL_IDS:
         channel = client.get_channel(channel_id)
         if channel is None:
-            print(f"Could not find channel with ID {channel_id}")
+            try:
+                channel = await client.fetch_channel(channel_id)
+            except discord.HTTPException as e:
+                print(f"Could not fetch channel {channel_id}: {e}")
+                continue
+
+        if not isinstance(channel, discord.TextChannel):
+            print(f"Channel {channel_id} is not a text channel, skipping.")
             continue
 
-        deleted = await _cleanup_single_channel(channel, now)
+        deleted = await cleanup_channel(channel, now)
         total_deleted += deleted
 
     print(f"Cleanup complete. Deleted {total_deleted} messages in total.")
-    # Disconnect the client so the process exits
     await client.close()
 
 
